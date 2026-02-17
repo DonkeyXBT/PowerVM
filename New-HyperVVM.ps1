@@ -269,38 +269,142 @@ function Select-HyperVNode {
 
 # -- Step 2: ISO Selection ----------------------------------------------------
 function Select-Iso {
+    param($HostInfo)
+
+    $targetHost = $HostInfo.ComputerName
+    $isLocal    = $HostInfo.IsLocal
+
     Show-Section "STEP 2 - Select Installation ISO"
 
-    if (-not (Test-Path $IsoFolder)) {
-        Write-Log "ISO folder not found: $IsoFolder" -Level ERROR
-        throw "ISO folder '$IsoFolder' does not exist. Please create it and add ISO files."
+    # Determine the ISO browse path
+    # For remote hosts, try the same folder via UNC, then the remote host's local path
+    $browsePathDisplay = $IsoFolder
+    $browsePath        = $null
+    $isoPathIsRemote   = $false
+    $isos              = @()
+
+    if ($isLocal) {
+        # Local host - browse local folder directly
+        if (Test-Path $IsoFolder) {
+            $browsePath = $IsoFolder
+            $isos = Get-ChildItem -Path $browsePath -Filter "*.iso" -File | Sort-Object Name
+        }
+    } else {
+        # Remote host - try multiple paths to find ISOs
+
+        # 1. Try UNC path to the ISO folder on the remote host (e.g. \\REMOTEHOST\D$\ISOs)
+        $uncIsoPath = "\\$targetHost\" + ($IsoFolder -replace ':', '$')
+        if (Test-Path $uncIsoPath -ErrorAction SilentlyContinue) {
+            $browsePath = $uncIsoPath
+            $browsePathDisplay = "$IsoFolder on $targetHost"
+            $isos = Get-ChildItem -Path $browsePath -Filter "*.iso" -File | Sort-Object Name
+            $isoPathIsRemote = $true
+        }
+
+        # 2. Try the local ISO folder (maybe it's a shared/mapped path accessible from both)
+        if ($isos.Count -eq 0 -and (Test-Path $IsoFolder -ErrorAction SilentlyContinue)) {
+            $browsePath = $IsoFolder
+            $browsePathDisplay = "$IsoFolder (local - will need to be accessible from $targetHost)"
+            $isos = Get-ChildItem -Path $browsePath -Filter "*.iso" -File | Sort-Object Name
+        }
     }
 
-    $isos = Get-ChildItem -Path $IsoFolder -Filter "*.iso" -File | Sort-Object Name
-    if ($isos.Count -eq 0) {
-        Write-Log "No ISO files found in $IsoFolder" -Level ERROR
-        throw "No .iso files found in '$IsoFolder'."
+    if ($isos.Count -gt 0) {
+        Write-Host "  Found $($isos.Count) ISO file(s) in $browsePathDisplay" -ForegroundColor Gray
+        Write-Host ""
+
+        for ($i = 0; $i -lt $isos.Count; $i++) {
+            $size = "{0:N2} GB" -f ($isos[$i].Length / 1GB)
+            Write-Host "    [$($i + 1)] " -ForegroundColor Yellow -NoNewline
+            Write-Host "$($isos[$i].Name)" -ForegroundColor White -NoNewline
+            Write-Host "  ($size)" -ForegroundColor DarkGray
+        }
+        Write-Host "    [0] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Enter a custom ISO path manually" -ForegroundColor DarkGray
+        Write-Host ""
+
+        $choice = Read-ValidatedInput `
+            -Prompt "Select ISO (0-$($isos.Count))" `
+            -Validator { param($v) $v -match '^\d+$' -and [int]$v -ge 0 -and [int]$v -le $isos.Count } `
+            -ErrorMessage "Enter a number between 0 and $($isos.Count)."
+
+        if ([int]$choice -gt 0) {
+            $selected = $isos[[int]$choice - 1]
+
+            if ($isoPathIsRemote) {
+                # Convert UNC browse path back to local path for the remote host
+                # e.g. \\HOST\D$\ISOs\file.iso -> D:\ISOs\file.iso
+                $remoteLocalPath = Join-Path $IsoFolder $selected.Name
+                Write-Log "ISO selected: $($selected.Name) (path on $targetHost : $remoteLocalPath)" -Level INFO
+                return $remoteLocalPath
+            } elseif (-not $isLocal) {
+                # Local browse but remote host - convert to UNC for the remote host to access
+                # Or just return local path and let user deal with access
+                Write-Host ""
+                Write-Host "  NOTE: The ISO is on this management machine." -ForegroundColor Yellow
+                Write-Host "  The remote host $targetHost needs to access this file." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  The ISO path as seen by $targetHost must be provided." -ForegroundColor Gray
+                Write-Host "  Examples:" -ForegroundColor DarkGray
+                Write-Host "    - UNC share:    \\fileserver\ISOs\$($selected.Name)" -ForegroundColor DarkGray
+                Write-Host "    - Cluster vol:  C:\ClusterStorage\Volume1\ISOs\$($selected.Name)" -ForegroundColor DarkGray
+                Write-Host "    - Same path:    $($selected.FullName)  (if drive is shared/replicated)" -ForegroundColor DarkGray
+                Write-Host ""
+
+                $remotePath = Read-ValidatedInput `
+                    -Prompt "ISO path accessible from $targetHost" `
+                    -Default $selected.FullName `
+                    -Validator { param($v) -not [string]::IsNullOrWhiteSpace($v) } `
+                    -ErrorMessage "Path cannot be empty."
+                Write-Log "ISO selected: $($selected.Name) (remote path: $remotePath)" -Level INFO
+                return $remotePath
+            } else {
+                Write-Log "ISO selected: $($selected.Name)" -Level INFO
+                return $selected.FullName
+            }
+        }
+        # Fall through to manual entry if choice is 0
+    } else {
+        Write-Host "  No ISO files found automatically." -ForegroundColor Yellow
+        if (-not $isLocal) {
+            Write-Host "  Could not browse $IsoFolder on $targetHost." -ForegroundColor Yellow
+        }
+        Write-Host ""
     }
 
-    Write-Host "  Found $($isos.Count) ISO file(s) in $IsoFolder" -ForegroundColor Gray
+    # Manual ISO path entry
+    Write-Host "  Enter the full path to the ISO file as accessible from $targetHost." -ForegroundColor Gray
+    if (-not $isLocal) {
+        Write-Host "  Examples:" -ForegroundColor DarkGray
+        Write-Host "    - UNC share:    \\fileserver\ISOs\server2025.iso" -ForegroundColor DarkGray
+        Write-Host "    - Cluster vol:  C:\ClusterStorage\Volume1\ISOs\server2025.iso" -ForegroundColor DarkGray
+        Write-Host "    - Local path:   D:\ISOs\server2025.iso  (on $targetHost)" -ForegroundColor DarkGray
+    }
     Write-Host ""
 
-    for ($i = 0; $i -lt $isos.Count; $i++) {
-        $size = "{0:N2} GB" -f ($isos[$i].Length / 1GB)
-        Write-Host "    [$($i + 1)] " -ForegroundColor Yellow -NoNewline
-        Write-Host "$($isos[$i].Name)" -ForegroundColor White -NoNewline
-        Write-Host "  ($size)" -ForegroundColor DarkGray
-    }
-    Write-Host ""
+    $manualPath = Read-ValidatedInput `
+        -Prompt "ISO path" `
+        -Validator {
+            param($v)
+            if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+            if ($v -notmatch '\.iso$') {
+                Write-Host "  Path must end with .iso" -ForegroundColor Red
+                return $false
+            }
+            # Try to verify the path exists (locally or via UNC)
+            if (Test-Path $v -ErrorAction SilentlyContinue) { return $true }
+            # For remote paths we can't always verify - accept it
+            if (-not $isLocal) {
+                Write-Host "  Cannot verify path from here - will attempt to use it on $targetHost." -ForegroundColor Yellow
+                return $true
+            }
+            Write-Host "  File not found: $v" -ForegroundColor Red
+            return $false
+        } `
+        -ErrorMessage "Enter a valid path to an ISO file."
 
-    $choice = Read-ValidatedInput `
-        -Prompt "Select ISO (1-$($isos.Count))" `
-        -Validator { param($v) $v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le $isos.Count } `
-        -ErrorMessage "Enter a number between 1 and $($isos.Count)."
-
-    $selected = $isos[[int]$choice - 1]
-    Write-Log "ISO selected: $($selected.Name)" -Level INFO
-    return $selected.FullName
+    Write-Log "ISO selected (manual): $manualPath" -Level INFO
+    return $manualPath
 }
 
 # -- Step 3: VM Configuration -------------------------------------------------
@@ -811,7 +915,7 @@ try {
     Write-Log "Log file: $LogFile"
 
     $hostInfo  = Select-HyperVNode
-    $isoPath   = Select-Iso
+    $isoPath   = Select-Iso -HostInfo $hostInfo
     $config    = Get-VMConfig -HostInfo $hostInfo
     $confirmed = Confirm-VMCreation -Config $config -IsoPath $isoPath -HostInfo $hostInfo
 
