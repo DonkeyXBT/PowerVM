@@ -1,5 +1,4 @@
 #Requires -RunAsAdministrator
-#Requires -Modules Hyper-V
 
 <#
 .SYNOPSIS
@@ -16,14 +15,30 @@
     Requires: Windows with Hyper-V role enabled, run as Administrator.
 #>
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+# -- Prerequisite Check -------------------------------------------------------
+if (-not (Get-Module -ListAvailable -Name Hyper-V)) {
+    Write-Host ""
+    Write-Host "  Hyper-V PowerShell module is not installed." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  To fix this, run one of the following in an elevated PowerShell:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "    # Windows 10/11 Pro/Enterprise:" -ForegroundColor DarkGray
+    Write-Host "    Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Management-PowerShell" -ForegroundColor White
+    Write-Host ""
+    Write-Host "    # Windows Server:" -ForegroundColor DarkGray
+    Write-Host "    Install-WindowsFeature -Name Hyper-V-PowerShell" -ForegroundColor White
+    Write-Host ""
+    exit 1
+}
+
+# -- Configuration -------------------------------------------------------------
 $IsoFolder       = "D:\ISOs"
 $DefaultVMPath   = (Get-VMHost).VirtualMachinePath
 $DefaultVHDPath  = (Get-VMHost).VirtualHardDiskPath
 $LogFolder       = Join-Path $PSScriptRoot "Logs"
 $LogFile         = Join-Path $LogFolder ("PowerVM_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# -- Logging -------------------------------------------------------------------
 if (-not (Test-Path $LogFolder)) { New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null }
 
 function Write-Log {
@@ -44,23 +59,23 @@ function Write-Log {
     }
 }
 
-# ── UI Helpers ─────────────────────────────────────────────────────────────────
+# -- UI Helpers ----------------------------------------------------------------
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
-    Write-Host "  ║                                                  ║" -ForegroundColor DarkCyan
-    Write-Host "  ║        ⚡  P O W E R  V M   C R E A T O R  ⚡   ║" -ForegroundColor Cyan
-    Write-Host "  ║           Hyper-V Virtual Machine Builder        ║" -ForegroundColor DarkCyan
-    Write-Host "  ║                                                  ║" -ForegroundColor DarkCyan
-    Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor DarkCyan
+    Write-Host "  +====================================================+" -ForegroundColor DarkCyan
+    Write-Host "  |                                                    |" -ForegroundColor DarkCyan
+    Write-Host "  |        P O W E R  V M   C R E A T O R             |" -ForegroundColor Cyan
+    Write-Host "  |           Hyper-V Virtual Machine Builder          |" -ForegroundColor DarkCyan
+    Write-Host "  |                                                    |" -ForegroundColor DarkCyan
+    Write-Host "  +====================================================+" -ForegroundColor DarkCyan
     Write-Host ""
 }
 
 function Show-Section {
     param([string]$Title)
     Write-Host ""
-    Write-Host "  ── $Title ──" -ForegroundColor White
+    Write-Host "  --- $Title ---" -ForegroundColor White
     Write-Host ""
 }
 
@@ -75,16 +90,16 @@ function Read-ValidatedInput {
         $display = if ($Default) { "$Prompt [default: $Default]" } else { $Prompt }
         Write-Host "  $display" -ForegroundColor White -NoNewline
         Write-Host ": " -NoNewline
-        $input = Read-Host
-        if ([string]::IsNullOrWhiteSpace($input) -and $Default) { $input = $Default }
-        if (& $Validator $input) { return $input }
+        $value = Read-Host
+        if ([string]::IsNullOrWhiteSpace($value) -and $Default) { $value = $Default }
+        if (& $Validator $value) { return $value }
         Write-Host "  $ErrorMessage" -ForegroundColor Red
     }
 }
 
-# ── Step 1: ISO Selection ─────────────────────────────────────────────────────
+# -- Step 1: ISO Selection ----------------------------------------------------
 function Select-Iso {
-    Show-Section "STEP 1 — Select Installation ISO"
+    Show-Section "STEP 1 - Select Installation ISO"
 
     if (-not (Test-Path $IsoFolder)) {
         Write-Log "ISO folder not found: $IsoFolder" -Level ERROR
@@ -97,7 +112,8 @@ function Select-Iso {
         throw "No .iso files found in '$IsoFolder'."
     }
 
-    Write-Host "  Found $($isos.Count) ISO file(s) in $IsoFolder`n" -ForegroundColor Gray
+    Write-Host "  Found $($isos.Count) ISO file(s) in $IsoFolder" -ForegroundColor Gray
+    Write-Host ""
 
     for ($i = 0; $i -lt $isos.Count; $i++) {
         $size = "{0:N2} GB" -f ($isos[$i].Length / 1GB)
@@ -117,9 +133,9 @@ function Select-Iso {
     return $selected.FullName
 }
 
-# ── Step 2: VM Configuration ──────────────────────────────────────────────────
+# -- Step 2: VM Configuration -------------------------------------------------
 function Get-VMConfig {
-    Show-Section "STEP 2 — VM Configuration"
+    Show-Section "STEP 2 - VM Configuration"
 
     # VM Name
     $vmName = Read-ValidatedInput `
@@ -143,7 +159,7 @@ function Get-VMConfig {
     Write-Host "  (Legacy BIOS, IDE)" -ForegroundColor DarkGray
     Write-Host "    [2] " -ForegroundColor Yellow -NoNewline
     Write-Host "Generation 2" -ForegroundColor White -NoNewline
-    Write-Host "  (UEFI, Secure Boot, TPM — Recommended)" -ForegroundColor DarkGray
+    Write-Host "  (UEFI, Secure Boot, TPM - Recommended)" -ForegroundColor DarkGray
     Write-Host ""
 
     $gen = Read-ValidatedInput `
@@ -210,7 +226,7 @@ function Get-VMConfig {
             Write-Log "Network: none"
         }
     } else {
-        Write-Log "No virtual switches found — skipping network config." -Level WARN
+        Write-Log "No virtual switches found - skipping network config." -Level WARN
     }
 
     # TPM (Gen 2 only)
@@ -238,11 +254,11 @@ function Get-VMConfig {
     }
 }
 
-# ── Step 3: Confirmation ──────────────────────────────────────────────────────
+# -- Step 3: Confirmation -----------------------------------------------------
 function Confirm-VMCreation {
     param($Config, $IsoPath)
 
-    Show-Section "STEP 3 — Review & Confirm"
+    Show-Section "STEP 3 - Review and Confirm"
 
     $isoName = Split-Path $IsoPath -Leaf
 
@@ -272,11 +288,11 @@ function Confirm-VMCreation {
     return $confirm -match '^[Yy]'
 }
 
-# ── Step 4: VM Creation ───────────────────────────────────────────────────────
+# -- Step 4: VM Creation ------------------------------------------------------
 function New-VMFromConfig {
     param($Config, $IsoPath)
 
-    Show-Section "STEP 4 — Creating Virtual Machine"
+    Show-Section "STEP 4 - Creating Virtual Machine"
 
     try {
         # Create the VM
@@ -320,7 +336,7 @@ function New-VMFromConfig {
         }
         Write-Log "ISO mounted." -Level SUCCESS
 
-        # TPM & Security (Gen 2)
+        # TPM and Security (Gen 2)
         if ($Config.Generation -eq 2) {
             if ($Config.TPM) {
                 Write-Log "Enabling TPM..."
@@ -329,33 +345,33 @@ function New-VMFromConfig {
                 Write-Log "TPM enabled." -Level SUCCESS
             }
 
-            # Disable Secure Boot for Linux ISOs (common convenience)
+            # Set Secure Boot template for Linux ISOs
             $isoName = (Split-Path $IsoPath -Leaf).ToLower()
             if ($isoName -match 'ubuntu|debian|centos|fedora|arch|linux|kali|rocky|alma|suse|mint') {
-                Write-Log "Linux ISO detected — setting Secure Boot template to MicrosoftUEFICertificateAuthority."
+                Write-Log "Linux ISO detected - setting Secure Boot template to MicrosoftUEFICertificateAuthority."
                 Set-VMFirmware -VMName $Config.Name -SecureBootTemplate MicrosoftUEFICertificateAuthority
             }
         }
 
-        # Enable automatic checkpoints off (cleaner experience)
+        # Disable automatic checkpoints (cleaner experience)
         Set-VM -VMName $Config.Name -AutomaticCheckpointsEnabled $false
         Write-Log "Automatic checkpoints disabled."
 
         Write-Host ""
-        Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor Green
-        Write-Host "  ║   VM '$($Config.Name)' created successfully!    ║" -ForegroundColor Green
-        Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+        Write-Host "  +====================================================+" -ForegroundColor Green
+        Write-Host "  |   VM '$($Config.Name)' created successfully!        |" -ForegroundColor Green
+        Write-Host "  +====================================================+" -ForegroundColor Green
         Write-Host ""
         Write-Log "VM '$($Config.Name)' creation completed successfully." -Level SUCCESS
 
         # Ask to start
-        $start = Read-ValidatedInput `
+        $startChoice = Read-ValidatedInput `
             -Prompt "Start the VM now? (Y/N)" `
             -Default "N" `
             -Validator { param($v) $v -in @("Y","y","N","n","Yes","yes","No","no") } `
             -ErrorMessage "Enter Y or N."
 
-        if ($start -match '^[Yy]') {
+        if ($startChoice -match '^[Yy]') {
             Start-VM -Name $Config.Name
             Write-Log "VM '$($Config.Name)' started." -Level SUCCESS
             vmconnect.exe localhost $Config.Name 2>$null
@@ -368,7 +384,7 @@ function New-VMFromConfig {
     }
 }
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 try {
     Show-Banner
     Write-Log "PowerVM session started."
@@ -387,7 +403,8 @@ try {
 }
 catch {
     Write-Log "Fatal error: $_" -Level ERROR
-    Write-Host "`n  Script terminated due to an error. Check the log: $LogFile" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Script terminated due to an error. Check the log: $LogFile" -ForegroundColor Red
     exit 1
 }
 finally {
