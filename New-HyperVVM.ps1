@@ -2,16 +2,17 @@
 
 <#
 .SYNOPSIS
-    Interactive Hyper-V Virtual Machine Creator.
+    Interactive Hyper-V Virtual Machine Creator with cluster node support.
 
 .DESCRIPTION
-    Creates Hyper-V virtual machines with an interactive menu. Scans D:\ISOs for
-    available ISO files, lets the user pick one, and configures VM name, CPU, RAM,
-    disk size, generation, network switch, and TPM.
+    Creates Hyper-V virtual machines with an interactive menu. Discovers cluster
+    nodes automatically or lets you target a specific Hyper-V host. Scans D:\ISOs
+    for available ISO files, and configures VM name, CPU, RAM, disk size,
+    generation, network switch, TPM, and static IP settings.
 
 .NOTES
     Author : PowerVM
-    Version: 1.0.0
+    Version: 1.1.0
     Requires: Windows with Hyper-V role enabled, run as Administrator.
 #>
 
@@ -32,11 +33,11 @@ if (-not (Get-Module -ListAvailable -Name Hyper-V)) {
 }
 
 # -- Configuration -------------------------------------------------------------
-$IsoFolder       = "D:\ISOs"
-$DefaultVMPath   = (Get-VMHost).VirtualMachinePath
-$DefaultVHDPath  = (Get-VMHost).VirtualHardDiskPath
-$LogFolder       = Join-Path $PSScriptRoot "Logs"
-$LogFile         = Join-Path $LogFolder ("PowerVM_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$IsoFolder = "D:\ISOs"
+$ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ScriptRoot -or $ScriptRoot -eq '') { $ScriptRoot = (Get-Location).Path }
+$LogFolder = Join-Path $ScriptRoot "Logs"
+$LogFile   = Join-Path $LogFolder ("PowerVM_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
 # -- Logging -------------------------------------------------------------------
 if (-not (Test-Path $LogFolder)) { New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null }
@@ -97,9 +98,162 @@ function Read-ValidatedInput {
     }
 }
 
-# -- Step 1: ISO Selection ----------------------------------------------------
+# -- Step 1: Hyper-V Node Selection -------------------------------------------
+function Select-HyperVNode {
+    Show-Section "STEP 1 - Select Hyper-V Host"
+
+    $localHost = $env:COMPUTERNAME
+    $nodes = @()
+
+    # Try to discover cluster nodes
+    $clusterAvailable = $false
+    if (Get-Module -ListAvailable -Name FailoverClusters -ErrorAction SilentlyContinue) {
+        try {
+            Import-Module FailoverClusters -ErrorAction Stop
+            $clusterNodes = Get-ClusterNode -ErrorAction Stop
+            if ($clusterNodes) {
+                $clusterAvailable = $true
+                $clusterName = (Get-Cluster -ErrorAction Stop).Name
+                Write-Host "  Failover Cluster detected: " -ForegroundColor Gray -NoNewline
+                Write-Host $clusterName -ForegroundColor White
+                Write-Host ""
+
+                foreach ($node in ($clusterNodes | Sort-Object Name)) {
+                    $status = $node.State.ToString()
+                    $hvOk = $false
+
+                    if ($status -eq "Up") {
+                        # Test if Hyper-V is responding on the node
+                        try {
+                            Get-VMHost -ComputerName $node.Name -ErrorAction Stop | Out-Null
+                            $hvOk = $true
+                        } catch {
+                            $hvOk = $false
+                        }
+                    }
+
+                    $nodes += [PSCustomObject]@{
+                        Name     = $node.Name
+                        Status   = $status
+                        HyperV   = $hvOk
+                    }
+                }
+
+                for ($i = 0; $i -lt $nodes.Count; $i++) {
+                    $n = $nodes[$i]
+                    $statusColor = if ($n.Status -eq "Up" -and $n.HyperV) { "Green" } elseif ($n.Status -eq "Up") { "Yellow" } else { "Red" }
+                    $hvLabel = if ($n.HyperV) { "Hyper-V OK" } elseif ($n.Status -eq "Up") { "Hyper-V unreachable" } else { $n.Status }
+                    $isLocal = if ($n.Name -eq $localHost) { " (local)" } else { "" }
+
+                    Write-Host "    [$($i + 1)] " -ForegroundColor Yellow -NoNewline
+                    Write-Host "$($n.Name)$isLocal" -ForegroundColor White -NoNewline
+                    Write-Host "  ($hvLabel)" -ForegroundColor $statusColor
+                }
+                Write-Host "    [0] " -ForegroundColor Yellow -NoNewline
+                Write-Host "Enter a different host manually" -ForegroundColor DarkGray
+                Write-Host ""
+            }
+        } catch {
+            Write-Log "Cluster query failed: $($_.Exception.Message)" -Level INFO
+        }
+    }
+
+    if (-not $clusterAvailable) {
+        Write-Host "  No failover cluster detected." -ForegroundColor Gray
+        Write-Host ""
+
+        # Check if local Hyper-V is available
+        $localHvOk = $false
+        try {
+            Get-VMHost -ErrorAction Stop | Out-Null
+            $localHvOk = $true
+        } catch {
+            $localHvOk = $false
+        }
+
+        if ($localHvOk) {
+            Write-Host "    [1] " -ForegroundColor Yellow -NoNewline
+            Write-Host "$localHost (local)" -ForegroundColor White -NoNewline
+            Write-Host "  (Hyper-V OK)" -ForegroundColor Green
+        } else {
+            Write-Host "    [1] " -ForegroundColor Yellow -NoNewline
+            Write-Host "$localHost (local)" -ForegroundColor White -NoNewline
+            Write-Host "  (Hyper-V not available)" -ForegroundColor Red
+        }
+        Write-Host "    [0] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Enter a different host manually" -ForegroundColor DarkGray
+        Write-Host ""
+
+        $nodes = @([PSCustomObject]@{ Name = $localHost; Status = "Up"; HyperV = $localHvOk })
+    }
+
+    # Node selection
+    $maxChoice = $nodes.Count
+    $nodeChoice = Read-ValidatedInput `
+        -Prompt "Select host (0-$maxChoice)" `
+        -Default "1" `
+        -Validator { param($v) $v -match '^\d+$' -and [int]$v -ge 0 -and [int]$v -le $maxChoice } `
+        -ErrorMessage "Enter a number between 0 and $maxChoice."
+
+    $targetHost = $null
+
+    if ([int]$nodeChoice -eq 0) {
+        # Manual entry
+        $targetHost = Read-ValidatedInput `
+            -Prompt "Enter Hyper-V host name or IP" `
+            -Validator {
+                param($v)
+                if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+                Write-Host "  Testing connection to $v..." -ForegroundColor Gray
+                try {
+                    Get-VMHost -ComputerName $v -ErrorAction Stop | Out-Null
+                    return $true
+                } catch {
+                    Write-Host "  Could not reach Hyper-V on '$v': $($_.Exception.Message)" -ForegroundColor Red
+                    return $false
+                }
+            } `
+            -ErrorMessage "Enter a valid Hyper-V host."
+    } else {
+        $selected = $nodes[[int]$nodeChoice - 1]
+        if (-not $selected.HyperV) {
+            Write-Log "Selected node '$($selected.Name)' does not have Hyper-V available." -Level WARN
+            $proceed = Read-ValidatedInput `
+                -Prompt "Node '$($selected.Name)' may not be reachable. Try anyway? (Y/N)" `
+                -Default "N" `
+                -Validator { param($v) $v -in @("Y","y","N","n") } `
+                -ErrorMessage "Enter Y or N."
+
+            if ($proceed -notmatch '^[Yy]') {
+                throw "Aborted: selected node is not available."
+            }
+        }
+        $targetHost = $selected.Name
+    }
+
+    # Get host paths from target
+    $isLocal = ($targetHost -eq $localHost)
+    Write-Log "Target Hyper-V host: $targetHost$(if ($isLocal) { ' (local)' })"
+
+    try {
+        $vmHost = Get-VMHost -ComputerName $targetHost -ErrorAction Stop
+        Write-Log "Connected to $targetHost - VM path: $($vmHost.VirtualMachinePath)" -Level SUCCESS
+    } catch {
+        Write-Log "Failed to connect to Hyper-V on $targetHost : $_" -Level ERROR
+        throw "Cannot connect to Hyper-V on '$targetHost'."
+    }
+
+    return @{
+        ComputerName = $targetHost
+        IsLocal      = $isLocal
+        VMPath       = $vmHost.VirtualMachinePath
+        VHDPath      = $vmHost.VirtualHardDiskPath
+    }
+}
+
+# -- Step 2: ISO Selection ----------------------------------------------------
 function Select-Iso {
-    Show-Section "STEP 1 - Select Installation ISO"
+    Show-Section "STEP 2 - Select Installation ISO"
 
     if (-not (Test-Path $IsoFolder)) {
         Write-Log "ISO folder not found: $IsoFolder" -Level ERROR
@@ -133,9 +287,13 @@ function Select-Iso {
     return $selected.FullName
 }
 
-# -- Step 2: VM Configuration -------------------------------------------------
+# -- Step 3: VM Configuration -------------------------------------------------
 function Get-VMConfig {
-    Show-Section "STEP 2 - VM Configuration"
+    param($HostInfo)
+
+    $targetHost = $HostInfo.ComputerName
+
+    Show-Section "STEP 3 - VM Configuration (on $targetHost)"
 
     # VM Name
     $vmName = Read-ValidatedInput `
@@ -143,8 +301,8 @@ function Get-VMConfig {
         -Validator {
             param($v)
             if ([string]::IsNullOrWhiteSpace($v)) { return $false }
-            if (Get-VM -Name $v -ErrorAction SilentlyContinue) {
-                Write-Host "  A VM with that name already exists." -ForegroundColor Red
+            if (Get-VM -ComputerName $targetHost -Name $v -ErrorAction SilentlyContinue) {
+                Write-Host "  A VM with that name already exists on $targetHost." -ForegroundColor Red
                 return $false
             }
             return $true
@@ -170,8 +328,13 @@ function Get-VMConfig {
     $generation = [int]$gen
     Write-Log "Generation: $generation"
 
-    # CPU
-    $maxCpu = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+    # CPU - query target host
+    try {
+        $maxCpu = (Get-CimInstance Win32_Processor -ComputerName $targetHost | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+    } catch {
+        $maxCpu = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+        Write-Log "Could not query CPU from $targetHost, using local CPU count." -Level WARN
+    }
     $cpuDefault = [Math]::Min(2, $maxCpu)
     $cpu = Read-ValidatedInput `
         -Prompt "CPU cores (1-$maxCpu)" `
@@ -199,10 +362,10 @@ function Get-VMConfig {
     $diskBytes = [int64]$disk * 1GB
     Write-Log "Disk size: ${disk} GB"
 
-    # Network Switch
-    $switches = Get-VMSwitch | Sort-Object Name
+    # Network Switch - from target host
+    $switches = Get-VMSwitch -ComputerName $targetHost -ErrorAction SilentlyContinue | Sort-Object Name
     $switchName = $null
-    if ($switches.Count -gt 0) {
+    if ($switches -and $switches.Count -gt 0) {
         Write-Host ""
         for ($i = 0; $i -lt $switches.Count; $i++) {
             Write-Host "    [$($i + 1)] " -ForegroundColor Yellow -NoNewline
@@ -226,7 +389,7 @@ function Get-VMConfig {
             Write-Log "Network: none"
         }
     } else {
-        Write-Log "No virtual switches found - skipping network config." -Level WARN
+        Write-Log "No virtual switches found on $targetHost - skipping network config." -Level WARN
     }
 
     # TPM (Gen 2 only)
@@ -337,14 +500,16 @@ function Get-VMConfig {
     }
 }
 
-# -- Step 3: Confirmation -----------------------------------------------------
+# -- Step 4: Confirmation -----------------------------------------------------
 function Confirm-VMCreation {
-    param($Config, $IsoPath)
+    param($Config, $IsoPath, $HostInfo)
 
-    Show-Section "STEP 3 - Review and Confirm"
+    Show-Section "STEP 4 - Review and Confirm"
 
     $isoName = Split-Path $IsoPath -Leaf
 
+    Write-Host "    Hyper-V Host ....... " -NoNewline -ForegroundColor DarkGray
+    Write-Host "$($HostInfo.ComputerName)$(if ($HostInfo.IsLocal) { ' (local)' })" -ForegroundColor White
     Write-Host "    VM Name ........... " -NoNewline -ForegroundColor DarkGray
     Write-Host $Config.Name -ForegroundColor White
     Write-Host "    Generation ........ " -NoNewline -ForegroundColor DarkGray
@@ -376,6 +541,11 @@ function Confirm-VMCreation {
         Write-Host "    DNS Servers ....... " -NoNewline -ForegroundColor DarkGray
         Write-Host $dnsDisplay -ForegroundColor White
     }
+
+    Write-Host "    VM Path ........... " -NoNewline -ForegroundColor DarkGray
+    Write-Host $HostInfo.VMPath -ForegroundColor White
+    Write-Host "    VHD Path .......... " -NoNewline -ForegroundColor DarkGray
+    Write-Host $HostInfo.VHDPath -ForegroundColor White
     Write-Host ""
 
     $confirm = Read-ValidatedInput `
@@ -386,51 +556,56 @@ function Confirm-VMCreation {
     return $confirm -match '^[Yy]'
 }
 
-# -- Step 4: VM Creation ------------------------------------------------------
+# -- Step 5: VM Creation ------------------------------------------------------
 function New-VMFromConfig {
-    param($Config, $IsoPath)
+    param($Config, $IsoPath, $HostInfo)
 
-    Show-Section "STEP 4 - Creating Virtual Machine"
+    $targetHost = $HostInfo.ComputerName
+    $vmPath     = $HostInfo.VMPath
+    $vhdPath    = $HostInfo.VHDPath
+
+    Show-Section "STEP 5 - Creating Virtual Machine on $targetHost"
 
     try {
         # Create the VM
-        Write-Log "Creating VM '$($Config.Name)'..."
+        Write-Log "Creating VM '$($Config.Name)' on $targetHost..."
         $vmParams = @{
             Name               = $Config.Name
+            ComputerName       = $targetHost
             MemoryStartupBytes = $Config.RAM
             Generation         = $Config.Generation
             NoVHD              = $true
-            Path               = $DefaultVMPath
+            Path               = $vmPath
         }
         if ($Config.Switch) { $vmParams.SwitchName = $Config.Switch }
 
         $vm = New-VM @vmParams
-        Write-Log "VM created successfully." -Level SUCCESS
+        Write-Log "VM created successfully on $targetHost." -Level SUCCESS
 
         # Create and attach VHDX
-        $vhdPath = Join-Path $DefaultVHDPath "$($Config.Name).vhdx"
-        Write-Log "Creating virtual disk: $vhdPath"
-        New-VHD -Path $vhdPath -SizeBytes $Config.DiskSize -Dynamic | Out-Null
+        $vhdFullPath = Join-Path $vhdPath "$($Config.Name).vhdx"
+        Write-Log "Creating virtual disk: $vhdFullPath"
+        New-VHD -ComputerName $targetHost -Path $vhdFullPath -SizeBytes $Config.DiskSize -Dynamic | Out-Null
 
         if ($Config.Generation -eq 1) {
-            Add-VMHardDiskDrive -VMName $Config.Name -Path $vhdPath
+            Add-VMHardDiskDrive -ComputerName $targetHost -VMName $Config.Name -Path $vhdFullPath
         } else {
-            Add-VMHardDiskDrive -VMName $Config.Name -ControllerType SCSI -Path $vhdPath
+            Add-VMHardDiskDrive -ComputerName $targetHost -VMName $Config.Name -ControllerType SCSI -Path $vhdFullPath
         }
         Write-Log "Virtual disk attached." -Level SUCCESS
 
         # Set CPU
         Write-Log "Setting CPU count to $($Config.CPU)..."
-        Set-VMProcessor -VMName $Config.Name -Count $Config.CPU
+        Set-VMProcessor -ComputerName $targetHost -VMName $Config.Name -Count $Config.CPU
 
         # Attach ISO
         Write-Log "Mounting ISO..."
         if ($Config.Generation -eq 1) {
-            Set-VMDvdDrive -VMName $Config.Name -Path $IsoPath
+            Set-VMDvdDrive -ComputerName $targetHost -VMName $Config.Name -Path $IsoPath
         } else {
-            Add-VMDvdDrive -VMName $Config.Name -Path $IsoPath
-            $dvd = Get-VMDvdDrive -VMName $Config.Name
-            Set-VMFirmware -VMName $Config.Name -FirstBootDevice $dvd
+            Add-VMDvdDrive -ComputerName $targetHost -VMName $Config.Name -Path $IsoPath
+            $dvd = Get-VMDvdDrive -ComputerName $targetHost -VMName $Config.Name
+            Set-VMFirmware -ComputerName $targetHost -VMName $Config.Name -FirstBootDevice $dvd
         }
         Write-Log "ISO mounted." -Level SUCCESS
 
@@ -438,8 +613,8 @@ function New-VMFromConfig {
         if ($Config.Generation -eq 2) {
             if ($Config.TPM) {
                 Write-Log "Enabling TPM..."
-                Set-VMKeyProtector -VMName $Config.Name -NewLocalKeyProtector
-                Enable-VMTPM -VMName $Config.Name
+                Set-VMKeyProtector -ComputerName $targetHost -VMName $Config.Name -NewLocalKeyProtector
+                Enable-VMTPM -ComputerName $targetHost -VMName $Config.Name
                 Write-Log "TPM enabled." -Level SUCCESS
             }
 
@@ -447,22 +622,24 @@ function New-VMFromConfig {
             $isoName = (Split-Path $IsoPath -Leaf).ToLower()
             if ($isoName -match 'ubuntu|debian|centos|fedora|arch|linux|kali|rocky|alma|suse|mint') {
                 Write-Log "Linux ISO detected - setting Secure Boot template to MicrosoftUEFICertificateAuthority."
-                Set-VMFirmware -VMName $Config.Name -SecureBootTemplate MicrosoftUEFICertificateAuthority
+                Set-VMFirmware -ComputerName $targetHost -VMName $Config.Name -SecureBootTemplate MicrosoftUEFICertificateAuthority
             }
         }
 
         # Disable automatic checkpoints (cleaner experience)
-        Set-VM -VMName $Config.Name -AutomaticCheckpointsEnabled $false
+        Set-VM -ComputerName $targetHost -VMName $Config.Name -AutomaticCheckpointsEnabled $false
         Write-Log "Automatic checkpoints disabled."
 
         Write-Host ""
         Write-Host "  +====================================================+" -ForegroundColor Green
         Write-Host "  |   VM '$($Config.Name)' created successfully!        |" -ForegroundColor Green
+        Write-Host "  |   Host: $($targetHost.PadRight(43))|" -ForegroundColor Green
         Write-Host "  +====================================================+" -ForegroundColor Green
         Write-Host ""
-        Write-Log "VM '$($Config.Name)' creation completed successfully." -Level SUCCESS
+        Write-Log "VM '$($Config.Name)' creation completed on $targetHost." -Level SUCCESS
 
         # Save network config script if static IP was chosen
+        $netScriptPath = $null
         if ($Config.Network.Mode -eq "Static") {
             $net = $Config.Network
             $dnsServers = @($net.DNS1)
@@ -471,6 +648,7 @@ function New-VMFromConfig {
 
             $netScriptContent = @"
 # PowerVM Network Configuration for $($Config.Name)
+# Created on host: $targetHost
 # Run this inside the guest VM after OS installation.
 # Requires: Run as Administrator
 
@@ -502,12 +680,23 @@ Write-Host '  IP Address .... $($net.IPAddress)/$($net.PrefixLength)' -Foregroun
 Write-Host '  Gateway ....... $($net.Gateway)' -ForegroundColor White
 Write-Host "  DNS Servers ... $($dnsServers -join ', ')" -ForegroundColor White
 "@
-            $netScriptPath = Join-Path $DefaultVMPath "$($Config.Name)\Set-Network.ps1"
-            $netScriptDir = Split-Path $netScriptPath -Parent
-            if (-not (Test-Path $netScriptDir)) {
-                New-Item -Path $netScriptDir -ItemType Directory -Force | Out-Null
+            $netScriptPath = Join-Path $vmPath "$($Config.Name)\Set-Network.ps1"
+            # Write to target host via UNC or local path
+            if ($HostInfo.IsLocal) {
+                $scriptDir = Split-Path $netScriptPath -Parent
+                if (-not (Test-Path $scriptDir)) {
+                    New-Item -Path $scriptDir -ItemType Directory -Force | Out-Null
+                }
+                $netScriptContent | Out-File -FilePath $netScriptPath -Encoding UTF8
+            } else {
+                # Convert local path to UNC for remote host
+                $uncPath = "\\$targetHost\" + ($netScriptPath -replace ':', '$')
+                $uncDir = Split-Path $uncPath -Parent
+                if (-not (Test-Path $uncDir)) {
+                    New-Item -Path $uncDir -ItemType Directory -Force | Out-Null
+                }
+                $netScriptContent | Out-File -FilePath $uncPath -Encoding UTF8
             }
-            $netScriptContent | Out-File -FilePath $netScriptPath -Encoding UTF8
             Write-Log "Network config script saved: $netScriptPath" -Level SUCCESS
         }
 
@@ -519,9 +708,9 @@ Write-Host "  DNS Servers ... $($dnsServers -join ', ')" -ForegroundColor White
             -ErrorMessage "Enter Y or N."
 
         if ($startChoice -match '^[Yy]') {
-            Start-VM -Name $Config.Name
-            Write-Log "VM '$($Config.Name)' started." -Level SUCCESS
-            vmconnect.exe localhost $Config.Name 2>$null
+            Start-VM -ComputerName $targetHost -Name $Config.Name
+            Write-Log "VM '$($Config.Name)' started on $targetHost." -Level SUCCESS
+            vmconnect.exe $targetHost $Config.Name 2>$null
         }
 
         # Apply network config via PowerShell Direct (after OS install)
@@ -555,24 +744,27 @@ Write-Host "  DNS Servers ... $($dnsServers -join ', ')" -ForegroundColor White
                     Write-Log "Applying network configuration via PowerShell Direct..."
 
                     try {
-                        Invoke-Command -VMName $Config.Name -Credential $guestCred -ScriptBlock {
-                            param($IP, $Prefix, $GW, $DNS)
+                        Invoke-Command -ComputerName $targetHost -ScriptBlock {
+                            param($VMName, $Cred, $IP, $Prefix, $GW, $DNS)
 
-                            $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
-                            if (-not $adapter) { throw "No active network adapter found in guest." }
+                            Invoke-Command -VMName $VMName -Credential $Cred -ScriptBlock {
+                                param($IP, $Prefix, $GW, $DNS)
 
-                            # Remove existing config
-                            Remove-NetIPAddress -InterfaceIndex $adapter.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
-                            Remove-NetRoute -InterfaceIndex $adapter.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
+                                $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+                                if (-not $adapter) { throw "No active network adapter found in guest." }
 
-                            # Apply new config
-                            New-NetIPAddress -InterfaceIndex $adapter.ifIndex `
-                                -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $GW
+                                Remove-NetIPAddress -InterfaceIndex $adapter.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
+                                Remove-NetRoute -InterfaceIndex $adapter.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
 
-                            Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex `
-                                -ServerAddresses $DNS
+                                New-NetIPAddress -InterfaceIndex $adapter.ifIndex `
+                                    -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $GW
 
-                        } -ArgumentList $net.IPAddress, $net.PrefixLength, $net.Gateway, $dnsArray
+                                Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex `
+                                    -ServerAddresses $DNS
+
+                            } -ArgumentList $IP, $Prefix, $GW, $DNS
+
+                        } -ArgumentList $Config.Name, $guestCred, $net.IPAddress, $net.PrefixLength, $net.Gateway, $dnsArray
 
                         Write-Log "Network configuration applied to guest VM." -Level SUCCESS
                     }
@@ -602,12 +794,13 @@ try {
     Write-Log "PowerVM session started."
     Write-Log "Log file: $LogFile"
 
-    $isoPath = Select-Iso
-    $config  = Get-VMConfig
-    $confirmed = Confirm-VMCreation -Config $config -IsoPath $isoPath
+    $hostInfo  = Select-HyperVNode
+    $isoPath   = Select-Iso
+    $config    = Get-VMConfig -HostInfo $hostInfo
+    $confirmed = Confirm-VMCreation -Config $config -IsoPath $isoPath -HostInfo $hostInfo
 
     if ($confirmed) {
-        New-VMFromConfig -Config $config -IsoPath $isoPath
+        New-VMFromConfig -Config $config -IsoPath $isoPath -HostInfo $hostInfo
     } else {
         Write-Log "VM creation cancelled by user." -Level WARN
         Write-Host "  Cancelled. No VM was created." -ForegroundColor Yellow
