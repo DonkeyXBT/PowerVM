@@ -241,6 +241,88 @@ function Get-VMConfig {
         Write-Log "TPM: $(if ($enableTPM) { 'Enabled' } else { 'Disabled' })"
     }
 
+    # Network IP Configuration
+    $netConfig = @{ Mode = "DHCP" }
+    if ($switchName) {
+        Write-Host ""
+        Write-Host "    [1] " -ForegroundColor Yellow -NoNewline
+        Write-Host "DHCP" -ForegroundColor White -NoNewline
+        Write-Host "  (Automatic IP from DHCP server)" -ForegroundColor DarkGray
+        Write-Host "    [2] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Static IP" -ForegroundColor White -NoNewline
+        Write-Host "  (Manually configure IP, gateway, DNS)" -ForegroundColor DarkGray
+        Write-Host ""
+
+        $ipMode = Read-ValidatedInput `
+            -Prompt "IP configuration" `
+            -Default "1" `
+            -Validator { param($v) $v -in @("1","2") } `
+            -ErrorMessage "Enter 1 or 2."
+
+        if ($ipMode -eq "2") {
+            $netConfig.Mode = "Static"
+
+            $ipAddr = Read-ValidatedInput `
+                -Prompt "IP address (e.g. 192.168.1.100)" `
+                -Validator {
+                    param($v)
+                    try { [System.Net.IPAddress]::Parse($v) | Out-Null; return $true }
+                    catch { return $false }
+                } `
+                -ErrorMessage "Enter a valid IPv4 address."
+            $netConfig.IPAddress = $ipAddr
+            Write-Log "Static IP: $ipAddr"
+
+            $prefix = Read-ValidatedInput `
+                -Prompt "Subnet prefix length (e.g. 24 for 255.255.255.0)" `
+                -Default "24" `
+                -Validator { param($v) $v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le 32 } `
+                -ErrorMessage "Enter a number between 1 and 32."
+            $netConfig.PrefixLength = [int]$prefix
+            Write-Log "Subnet prefix: /$prefix"
+
+            $gateway = Read-ValidatedInput `
+                -Prompt "Default gateway (e.g. 192.168.1.1)" `
+                -Validator {
+                    param($v)
+                    try { [System.Net.IPAddress]::Parse($v) | Out-Null; return $true }
+                    catch { return $false }
+                } `
+                -ErrorMessage "Enter a valid IPv4 address."
+            $netConfig.Gateway = $gateway
+            Write-Log "Gateway: $gateway"
+
+            $dns1 = Read-ValidatedInput `
+                -Prompt "Primary DNS server (e.g. 8.8.8.8)" `
+                -Default "8.8.8.8" `
+                -Validator {
+                    param($v)
+                    try { [System.Net.IPAddress]::Parse($v) | Out-Null; return $true }
+                    catch { return $false }
+                } `
+                -ErrorMessage "Enter a valid IPv4 address."
+            $netConfig.DNS1 = $dns1
+            Write-Log "Primary DNS: $dns1"
+
+            $dns2 = Read-ValidatedInput `
+                -Prompt "Secondary DNS server (leave blank to skip)" `
+                -Default "" `
+                -Validator {
+                    param($v)
+                    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
+                    try { [System.Net.IPAddress]::Parse($v) | Out-Null; return $true }
+                    catch { return $false }
+                } `
+                -ErrorMessage "Enter a valid IPv4 address or leave blank."
+            if (-not [string]::IsNullOrWhiteSpace($dns2)) {
+                $netConfig.DNS2 = $dns2
+                Write-Log "Secondary DNS: $dns2"
+            }
+        } else {
+            Write-Log "Network mode: DHCP"
+        }
+    }
+
     return @{
         Name       = $vmName
         Generation = $generation
@@ -251,6 +333,7 @@ function Get-VMConfig {
         DiskDisplay= $disk
         Switch     = $switchName
         TPM        = $enableTPM
+        Network    = $netConfig
     }
 }
 
@@ -278,6 +361,21 @@ function Confirm-VMCreation {
     Write-Host $(if ($Config.TPM) { "Enabled" } else { "Disabled" }) -ForegroundColor White
     Write-Host "    ISO ............... " -NoNewline -ForegroundColor DarkGray
     Write-Host $isoName -ForegroundColor White
+
+    # Network details
+    $net = $Config.Network
+    Write-Host "    IP Mode ........... " -NoNewline -ForegroundColor DarkGray
+    Write-Host $net.Mode -ForegroundColor White
+    if ($net.Mode -eq "Static") {
+        Write-Host "    IP Address ........ " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($net.IPAddress)/$($net.PrefixLength)" -ForegroundColor White
+        Write-Host "    Gateway ........... " -NoNewline -ForegroundColor DarkGray
+        Write-Host $net.Gateway -ForegroundColor White
+        $dnsDisplay = $net.DNS1
+        if ($net.DNS2) { $dnsDisplay += ", $($net.DNS2)" }
+        Write-Host "    DNS Servers ....... " -NoNewline -ForegroundColor DarkGray
+        Write-Host $dnsDisplay -ForegroundColor White
+    }
     Write-Host ""
 
     $confirm = Read-ValidatedInput `
@@ -364,6 +462,55 @@ function New-VMFromConfig {
         Write-Host ""
         Write-Log "VM '$($Config.Name)' creation completed successfully." -Level SUCCESS
 
+        # Save network config script if static IP was chosen
+        if ($Config.Network.Mode -eq "Static") {
+            $net = $Config.Network
+            $dnsServers = @($net.DNS1)
+            if ($net.DNS2) { $dnsServers += $net.DNS2 }
+            $dnsString = ($dnsServers | ForEach-Object { "'$_'" }) -join ","
+
+            $netScriptContent = @"
+# PowerVM Network Configuration for $($Config.Name)
+# Run this inside the guest VM after OS installation.
+# Requires: Run as Administrator
+
+`$adapter = Get-NetAdapter | Where-Object { `$_.Status -eq 'Up' } | Select-Object -First 1
+if (-not `$adapter) {
+    Write-Host 'No active network adapter found.' -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Configuring adapter: `$(`$adapter.Name)" -ForegroundColor Cyan
+
+# Remove existing IP config
+Remove-NetIPAddress -InterfaceIndex `$adapter.ifIndex -Confirm:`$false -ErrorAction SilentlyContinue
+Remove-NetRoute -InterfaceIndex `$adapter.ifIndex -Confirm:`$false -ErrorAction SilentlyContinue
+
+# Set static IP
+New-NetIPAddress -InterfaceIndex `$adapter.ifIndex ``
+    -IPAddress '$($net.IPAddress)' ``
+    -PrefixLength $($net.PrefixLength) ``
+    -DefaultGateway '$($net.Gateway)'
+
+# Set DNS servers
+Set-DnsClientServerAddress -InterfaceIndex `$adapter.ifIndex ``
+    -ServerAddresses @($dnsString)
+
+Write-Host 'Network configuration applied successfully.' -ForegroundColor Green
+Write-Host ''
+Write-Host '  IP Address .... $($net.IPAddress)/$($net.PrefixLength)' -ForegroundColor White
+Write-Host '  Gateway ....... $($net.Gateway)' -ForegroundColor White
+Write-Host "  DNS Servers ... $($dnsServers -join ', ')" -ForegroundColor White
+"@
+            $netScriptPath = Join-Path $DefaultVMPath "$($Config.Name)\Set-Network.ps1"
+            $netScriptDir = Split-Path $netScriptPath -Parent
+            if (-not (Test-Path $netScriptDir)) {
+                New-Item -Path $netScriptDir -ItemType Directory -Force | Out-Null
+            }
+            $netScriptContent | Out-File -FilePath $netScriptPath -Encoding UTF8
+            Write-Log "Network config script saved: $netScriptPath" -Level SUCCESS
+        }
+
         # Ask to start
         $startChoice = Read-ValidatedInput `
             -Prompt "Start the VM now? (Y/N)" `
@@ -375,6 +522,71 @@ function New-VMFromConfig {
             Start-VM -Name $Config.Name
             Write-Log "VM '$($Config.Name)' started." -Level SUCCESS
             vmconnect.exe localhost $Config.Name 2>$null
+        }
+
+        # Apply network config via PowerShell Direct (after OS install)
+        if ($Config.Network.Mode -eq "Static" -and $Config.Switch) {
+            Write-Host ""
+            Write-Host "  --- Network Configuration ---" -ForegroundColor White
+            Write-Host ""
+            Write-Host "  Static IP was configured. You can apply it after OS installation:" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "    Option 1: Apply now via PowerShell Direct (Windows guest, OS must be installed)" -ForegroundColor DarkGray
+            Write-Host "    Option 2: Skip now, run the saved script later inside the VM" -ForegroundColor DarkGray
+            Write-Host "              Script: $netScriptPath" -ForegroundColor DarkGray
+            Write-Host ""
+
+            $applyNow = Read-ValidatedInput `
+                -Prompt "Apply network config now via PowerShell Direct? (Y/N)" `
+                -Default "N" `
+                -Validator { param($v) $v -in @("Y","y","N","n","Yes","yes","No","no") } `
+                -ErrorMessage "Enter Y or N."
+
+            if ($applyNow -match '^[Yy]') {
+                Write-Host ""
+                Write-Host "  Enter credentials for the guest VM:" -ForegroundColor White
+                $guestCred = Get-Credential -Message "Guest VM credentials for $($Config.Name)"
+
+                if ($guestCred) {
+                    $net = $Config.Network
+                    $dnsArray = @($net.DNS1)
+                    if ($net.DNS2) { $dnsArray += $net.DNS2 }
+
+                    Write-Log "Applying network configuration via PowerShell Direct..."
+
+                    try {
+                        Invoke-Command -VMName $Config.Name -Credential $guestCred -ScriptBlock {
+                            param($IP, $Prefix, $GW, $DNS)
+
+                            $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+                            if (-not $adapter) { throw "No active network adapter found in guest." }
+
+                            # Remove existing config
+                            Remove-NetIPAddress -InterfaceIndex $adapter.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
+                            Remove-NetRoute -InterfaceIndex $adapter.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
+
+                            # Apply new config
+                            New-NetIPAddress -InterfaceIndex $adapter.ifIndex `
+                                -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $GW
+
+                            Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex `
+                                -ServerAddresses $DNS
+
+                        } -ArgumentList $net.IPAddress, $net.PrefixLength, $net.Gateway, $dnsArray
+
+                        Write-Log "Network configuration applied to guest VM." -Level SUCCESS
+                    }
+                    catch {
+                        Write-Log "Could not apply network config: $_" -Level WARN
+                        Write-Host "  You can apply it later by running the script inside the VM:" -ForegroundColor Yellow
+                        Write-Host "  $netScriptPath" -ForegroundColor White
+                    }
+                }
+            } else {
+                Write-Log "Network config deferred. Script saved for later use."
+                Write-Host "  To apply later, copy and run inside the VM:" -ForegroundColor Gray
+                Write-Host "  $netScriptPath" -ForegroundColor White
+            }
         }
     }
     catch {
