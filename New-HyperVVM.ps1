@@ -33,10 +33,24 @@ if (-not (Get-Module -ListAvailable -Name Hyper-V)) {
 }
 
 # -- Configuration -------------------------------------------------------------
-$IsoFolder = "D:\ISOs"
-$ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
-if (-not $ScriptRoot -or $ScriptRoot -eq '') { $ScriptRoot = (Get-Location).Path }
-$LogFolder = Join-Path $ScriptRoot "Logs"
+$IsoFolder  = "D:\ISOs"
+
+# Resolve script directory (works for .ps1 execution, ISE, VS Code, and console paste)
+$ScriptDir = $null
+if ($PSScriptRoot -and $PSScriptRoot -ne '') {
+    $ScriptDir = $PSScriptRoot
+}
+if (-not $ScriptDir) {
+    try { $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path -ErrorAction Stop } catch {}
+}
+if (-not $ScriptDir) {
+    try { $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition -ErrorAction Stop } catch {}
+}
+if (-not $ScriptDir -or $ScriptDir -eq '' -or $ScriptDir -eq '.') {
+    $ScriptDir = (Get-Location).Path
+}
+
+$LogFolder = Join-Path $ScriptDir "Logs"
 $LogFile   = Join-Path $LogFolder ("PowerVM_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
 # -- Logging -------------------------------------------------------------------
@@ -50,7 +64,9 @@ function Write-Log {
     )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry = "[$timestamp] [$Level] $Message"
-    Add-Content -Path $LogFile -Value $entry
+    if ($LogFile) {
+        try { Add-Content -Path $LogFile -Value $entry -ErrorAction Stop } catch {}
+    }
 
     switch ($Level) {
         "INFO"    { Write-Host "  $Message" -ForegroundColor Cyan }
